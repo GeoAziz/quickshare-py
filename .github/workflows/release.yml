@@ -56,7 +56,6 @@ jobs:
     name: Publish to Test PyPI (optional)
     runs-on: ubuntu-latest
     needs: build
-    if: secrets.TEST_PYPI_TOKEN != ''
     steps:
       - name: Download artifacts
         uses: actions/download-artifact@v4
@@ -74,13 +73,17 @@ jobs:
           TWINE_USERNAME: __token__
           TWINE_PASSWORD: ${{ secrets.TEST_PYPI_TOKEN }}
         run: |
-          python -m twine upload --repository-url https://test.pypi.org/legacy/ dist/*
+          if [ -n "$TWINE_PASSWORD" ]; then
+            echo "TEST_PYPI_TOKEN present — uploading to Test PyPI"
+            python -m twine upload --repository-url https://test.pypi.org/legacy/ dist/*
+          else
+            echo "TEST_PYPI_TOKEN not set — skipping Test PyPI upload"
+          fi
 
   publish_pypi:
     name: Publish to PyPI (optional)
     runs-on: ubuntu-latest
     needs: build
-    if: "secrets.PYPI_TOKEN != '' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.event.inputs.publish_to_pypi == 'true'))"
     environment: production
     steps:
       - name: Download artifacts
@@ -98,5 +101,16 @@ jobs:
         env:
           TWINE_USERNAME: __token__
           TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
+          PUBLISH_TO_PYPI: ${{ github.event.inputs.publish_to_pypi }}
         run: |
-          python -m twine upload dist/*
+          if [ -n "$TWINE_PASSWORD" ]; then
+            # publish on tag push or when manual trigger sets publish_to_pypi=true
+            if [ "$GITHUB_EVENT_NAME" = "push" ] || [ "$PUBLISH_TO_PYPI" = "true" ]; then
+              echo "PYPI_TOKEN present and publish requested — uploading to PyPI"
+              python -m twine upload dist/*
+            else
+              echo "Publish not requested for this event ('$GITHUB_EVENT_NAME', publish_to_pypi='$PUBLISH_TO_PYPI') — skipping PyPI upload"
+            fi
+          else
+            echo "PYPI_TOKEN not set — skipping PyPI upload"
+          fi

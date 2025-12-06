@@ -31,7 +31,7 @@ jobs:
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: dist
+          name: dist-py${{ matrix.python-version }}
           path: dist/*
 
   create_release:
@@ -43,8 +43,11 @@ jobs:
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
-          name: dist
-          path: dist
+          path: all-artifacts
+      - name: Flatten artifacts
+        run: |
+          mkdir -p dist
+          find all-artifacts -type f -name '*.tar.gz' -o -name '*.whl' | xargs -I {} cp {} dist/
       - name: Create release and upload assets
         uses: softprops/action-gh-release@v1
         with:
@@ -60,8 +63,11 @@ jobs:
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
-          name: dist
-          path: dist
+          path: all-artifacts
+      - name: Flatten artifacts
+        run: |
+          mkdir -p dist
+          find all-artifacts -type f \( -name '*.tar.gz' -o -name '*.whl' \) | xargs -I {} cp {} dist/
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
@@ -88,8 +94,11 @@ jobs:
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
-          name: dist
-          path: dist
+          path: all-artifacts
+      - name: Flatten artifacts
+        run: |
+          mkdir -p dist
+          find all-artifacts -type f \( -name '*.tar.gz' -o -name '*.whl' \) | xargs -I {} cp {} dist/
       - name: Set up Python
         uses: actions/setup-python@v4
         with:

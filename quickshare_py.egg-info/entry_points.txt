@@ -1,0 +1,2 @@
+[console_scripts]
+quickshare = quickshare.cli:main

@@ -74,7 +74,6 @@ jobs:
           TWINE_PASSWORD: ${{ secrets.TEST_PYPI_TOKEN }}
         run: |
           if [ -n "$TWINE_PASSWORD" ]; then
-            echo "TEST_PYPI_TOKEN present — uploading to Test PyPI"
             python -m twine upload --repository-url https://test.pypi.org/legacy/ dist/*
           else
             echo "TEST_PYPI_TOKEN not set — skipping Test PyPI upload"
@@ -104,12 +103,11 @@ jobs:
           PUBLISH_TO_PYPI: ${{ github.event.inputs.publish_to_pypi }}
         run: |
           if [ -n "$TWINE_PASSWORD" ]; then
-            # publish on tag push or when manual trigger sets publish_to_pypi=true
             if [ "$GITHUB_EVENT_NAME" = "push" ] || [ "$PUBLISH_TO_PYPI" = "true" ]; then
-              echo "PYPI_TOKEN present and publish requested — uploading to PyPI"
+              echo "Publishing to PyPI..."
               python -m twine upload dist/*
             else
-              echo "Publish not requested for this event ('$GITHUB_EVENT_NAME', publish_to_pypi='$PUBLISH_TO_PYPI') — skipping PyPI upload"
+              echo "Publish not requested for this event — skipping PyPI upload"
             fi
           else
             echo "PYPI_TOKEN not set — skipping PyPI upload"

@@ -16,3 +16,19 @@ venv/
 # system files
 Thumbs.db
 .DS_Store
+
+.env
+
+# quickshare artifacts
+artifacts/
+received/
+*.tar.gz
+*.part
+
+# SQLite database
+.quickshare_progress.db
+
+# Build artifacts
+*.egg-info/
+dist/
+build/

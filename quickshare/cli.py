@@ -157,8 +157,9 @@ def cmd_recv(args) -> int:
         size = int(offer.get('size', 0))
         chunk_size = int(offer.get('chunk_size', args.chunk_size))
         total_chunks = int(offer.get('total_chunks', 1))
-        save_path = os.path.join(out_dir, filename)
-        r = Receiver(save_path, chunk_size, total_chunks)
+    save_path = os.path.join(out_dir, filename)
+    # pass out_dir to Receiver so it will enforce writes into the configured output folder
+    r = Receiver(save_path, chunk_size, total_chunks, out_dir=out_dir)
         receivers.append(r)
         return r.handle_offer_and_receive(offer)
 

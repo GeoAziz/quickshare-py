@@ -28,8 +28,12 @@ def _read_n(conn, n):
 
 
 class Receiver:
-    def __init__(self, save_path: str, chunk_size: int, total_chunks: int):
+    def __init__(self, save_path: str, chunk_size: int, total_chunks: int, out_dir: Optional[str] = None):
+        # save_path is the suggested/desired path for the received file (may be inside an offer).
+        # out_dir, if provided, is the enforced directory where received files (and .part temp files)
+        # must be written. This prevents accidental writes to repo root or other paths.
         self.save_path = os.path.abspath(save_path)
+        self.out_dir = os.path.abspath(out_dir) if out_dir else None
         self.chunk_size = chunk_size
         self.total_chunks = total_chunks
         self._data_listeners = []  # (socket, thread, port)
@@ -92,11 +96,35 @@ class Receiver:
         # ensure values
         self.chunk_size = chunk_size
         self.total_chunks = total_chunks
-        # create temp path in same dir
+        # create temporary path (base name) and ensure it is created inside the
+        # enforced out_dir if provided.
         base = os.path.basename(filename)
-        tmp = os.path.abspath(filename + '.part')
+
+        try:
+            offered_dir = os.path.dirname(self.save_path) if self.save_path else ''
+        except Exception:
+            offered_dir = ''
+
+        if self.out_dir:
+            os.makedirs(self.out_dir, exist_ok=True)
+            tmp = os.path.abspath(os.path.join(self.out_dir, base + '.part'))
+        elif offered_dir:
+            # allow offered_dir if it's reasonable (inside cwd)
+            cwd = os.path.abspath(os.getcwd())
+            try:
+                if os.path.commonpath([cwd, offered_dir]) == cwd:
+                    tmp = os.path.abspath(os.path.join(offered_dir, base + '.part'))
+                else:
+                    tmp = os.path.abspath(os.path.join(cwd, base + '.part'))
+            except Exception:
+                tmp = os.path.abspath(os.path.join(cwd, base + '.part'))
+        else:
+            tmp = os.path.abspath(base + '.part')
+
         # preallocate
         preallocate_file(tmp, size)
+        # the internal save_path is the temp file we write to; final move/rename
+        # can be handled by caller (or by finalize)
         self.save_path = tmp
 
         ports = self._start_data_listeners()

@@ -36,26 +36,36 @@ DB_PATH = os.path.abspath('.quickshare_progress.db')
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
-    try:
-        conn.execute(
-            'CREATE TABLE IF NOT EXISTS transfers (tid TEXT PRIMARY KEY, bytes_sent INTEGER, total_bytes INTEGER, completed INTEGER, error TEXT, started_at TEXT, finished_at TEXT)'
-        )
-        # Ensure columns exist for older DBs: add started_at/finished_at if missing
-        cur = conn.execute("PRAGMA table_info('transfers')")
-        cols = [r[1] for r in cur.fetchall()]
-        if 'started_at' not in cols:
-            try:
-                conn.execute("ALTER TABLE transfers ADD COLUMN started_at TEXT")
-            except Exception:
-                pass
-        if 'finished_at' not in cols:
-            try:
-                conn.execute("ALTER TABLE transfers ADD COLUMN finished_at TEXT")
-            except Exception:
-                pass
-        conn.commit()
-    finally:
-        conn.close()
+  try:
+    conn.execute(
+      'CREATE TABLE IF NOT EXISTS transfers (tid TEXT PRIMARY KEY, bytes_sent INTEGER, total_bytes INTEGER, completed INTEGER, error TEXT, started_at TEXT, finished_at TEXT, sha256 TEXT, save_path TEXT)'
+    )
+    # Ensure columns exist for older DBs: add started_at/finished_at if missing
+    cur = conn.execute("PRAGMA table_info('transfers')")
+    cols = [r[1] for r in cur.fetchall()]
+    if 'started_at' not in cols:
+      try:
+        conn.execute("ALTER TABLE transfers ADD COLUMN started_at TEXT")
+      except Exception:
+        pass
+    if 'finished_at' not in cols:
+      try:
+        conn.execute("ALTER TABLE transfers ADD COLUMN finished_at TEXT")
+      except Exception:
+        pass
+    if 'sha256' not in cols:
+      try:
+        conn.execute("ALTER TABLE transfers ADD COLUMN sha256 TEXT")
+      except Exception:
+        pass
+    if 'save_path' not in cols:
+      try:
+        conn.execute("ALTER TABLE transfers ADD COLUMN save_path TEXT")
+      except Exception:
+        pass
+    conn.commit()
+  finally:
+    conn.close()
 
 
 init_db()
@@ -414,16 +424,55 @@ def start_recv():
     if RECV_STATE['server']:
         return redirect(url_for('index'))
 
-    def make_handler(offer):
-        # simple behavior: write to received/<filename>.part
-        from quickshare.transfer import Receiver
-        outdir = os.path.abspath('received')
-        os.makedirs(outdir, exist_ok=True)
-        filename = offer.get('filename', 'received')
-        save_path = os.path.join(outdir, filename)
-        total_chunks = int(offer.get('total_chunks', 1))
+  def make_handler(offer):
+    # simple behavior: write to received/<filename>.part
+    from quickshare.transfer import Receiver
+    import uuid, datetime
+    outdir = os.path.abspath('received')
+    os.makedirs(outdir, exist_ok=True)
+    filename = offer.get('filename', 'received')
+    save_path = os.path.join(outdir, filename)
+    total_chunks = int(offer.get('total_chunks', 1))
     chunk_size = int(offer.get('chunk_size', 1024*1024))
-    r = Receiver(save_path, chunk_size, total_chunks, out_dir=outdir)
+
+    # allocate a tid for this incoming transfer so we can track it in DB
+    tid = str(uuid.uuid4())
+
+    def on_start(meta):
+      # meta contains filename, size, total_chunks, save_path
+      try:
+        started = datetime.datetime.utcnow().isoformat()
+        conn = sqlite3.connect(DB_PATH)
+        try:
+          conn.execute('INSERT OR REPLACE INTO transfers (tid, bytes_sent, total_bytes, completed, error, started_at, save_path) VALUES (?, ?, ?, ?, ?, ?, ?)', (tid, 0, int(meta.get('size', 0)), 0, None, started, meta.get('save_path')))
+          conn.commit()
+        finally:
+          conn.close()
+      except Exception:
+        pass
+      try:
+        socketio.emit('receiver_started', {'tid': tid, 'filename': meta.get('filename'), 'size': meta.get('size')})
+      except Exception:
+        pass
+
+    def on_complete(meta):
+      # meta contains save_path, sha256, ok
+      try:
+        finished = datetime.datetime.utcnow().isoformat()
+        conn = sqlite3.connect(DB_PATH)
+        try:
+          conn.execute('UPDATE transfers SET completed = 1, finished_at = ?, sha256 = ? WHERE tid = ?', (finished, meta.get('sha256'), tid))
+          conn.commit()
+        finally:
+          conn.close()
+      except Exception:
+        pass
+      try:
+        socketio.emit('receiver_completed', {'tid': tid, 'sha256': meta.get('sha256'), 'ok': meta.get('ok'), 'save_path': meta.get('save_path')})
+      except Exception:
+        pass
+
+    r = Receiver(save_path, chunk_size, total_chunks, out_dir=outdir, on_start=on_start, on_complete=on_complete)
     return r.handle_offer_and_receive(offer)
 
     srv = ControlServer(host=bind, port=port, handler=make_handler)
@@ -578,20 +627,31 @@ def progress():
 
 @app.route('/history')
 def history():
-    conn = sqlite3.connect(DB_PATH)
-    try:
-        cur = conn.execute('SELECT tid, bytes_sent, total_bytes, completed, error, started_at, finished_at FROM transfers ORDER BY started_at DESC')
-        rows = cur.fetchall()
-        items = [{'tid': r[0], 'bytes_sent': r[1], 'total_bytes': r[2], 'completed': bool(r[3]), 'error': r[4], 'started_at': r[5], 'finished_at': r[6]} for r in rows]
-        # simple HTML
-        html = ['<h1>Transfer history</h1>', '<a href="/">Back</a>', '<table border="1"><tr><th>tid</th><th>bytes_sent</th><th>total_bytes</th><th>completed</th><th>started_at</th><th>finished_at</th><th>error</th></tr>']
-        for it in items:
-            html.append(f"<tr><td>{it['tid']}</td><td>{it['bytes_sent']}</td><td>{it['total_bytes']}</td><td>{it['completed']}</td><td>{it['started_at']}</td><td>{it['finished_at']}</td><td>{it['error'] or ''}</td></tr>")
-        html.append('</table>')
-        html.append('<form method="post" action="/clear-history"><button>Clear history</button></form>')
-        return '\n'.join(html)
-    finally:
-        conn.close()
+  conn = sqlite3.connect(DB_PATH)
+  try:
+    cur = conn.execute('SELECT tid, bytes_sent, total_bytes, completed, error, started_at, finished_at, sha256, save_path FROM transfers ORDER BY started_at DESC')
+    rows = cur.fetchall()
+    items = [{'tid': r[0], 'bytes_sent': r[1], 'total_bytes': r[2], 'completed': bool(r[3]), 'error': r[4], 'started_at': r[5], 'finished_at': r[6], 'sha256': r[7], 'save_path': r[8]} for r in rows]
+    # simple HTML with Extract/Verify buttons for completed transfers
+    html = ['<h1>Transfer history</h1>', '<a href="/">Back</a>', '<table border="1"><tr><th>tid</th><th>bytes_sent</th><th>total_bytes</th><th>completed</th><th>started_at</th><th>finished_at</th><th>sha256</th><th>actions</th></tr>']
+    for it in items:
+      actions = ''
+      if it['completed'] and it.get('save_path'):
+        # Extract button posts to /extract with path
+        actions = (
+          f"<form method=\"post\" action=\"/extract\" style=\"display:inline\">"
+          f"<input type=\"hidden\" name=\"path\" value=\"{it['save_path']}\">"
+          f"<button>Extract</button></form>"
+          f"<form method=\"post\" action=\"/verify\" style=\"display:inline;margin-left:8px\">"
+          f"<input type=\"hidden\" name=\"tid\" value=\"{it['tid']}\">"
+          f"<button>Verify only</button></form>"
+        )
+      html.append(f"<tr><td>{it['tid']}</td><td>{it['bytes_sent']}</td><td>{it['total_bytes']}</td><td>{it['completed']}</td><td>{it['started_at']}</td><td>{it['finished_at']}</td><td>{it.get('sha256') or ''}</td><td>{actions}</td></tr>")
+    html.append('</table>')
+    html.append('<form method="post" action="/clear-history"><button>Clear history</button></form>')
+    return '\n'.join(html)
+  finally:
+    conn.close()
 
 
 @app.route('/clear-history', methods=['POST'])
@@ -603,6 +663,30 @@ def clear_history():
     finally:
         conn.close()
     return redirect(url_for('history'))
+
+
+@app.route('/verify', methods=['POST'])
+def verify():
+  tid = request.form.get('tid')
+  if not tid:
+    return jsonify({'error': 'missing tid'}), 400
+  conn = sqlite3.connect(DB_PATH)
+  try:
+    cur = conn.execute('SELECT save_path, sha256 FROM transfers WHERE tid = ?', (tid,))
+    row = cur.fetchone()
+    if not row:
+      return jsonify({'error': 'not found'}), 404
+    save_path, recorded = row
+  finally:
+    conn.close()
+  if not save_path or not os.path.exists(save_path):
+    return jsonify({'error': 'file not found'}), 404
+  try:
+    actual = sha256_file(save_path)
+    ok = (recorded == actual) if recorded else False
+    return jsonify({'tid': tid, 'recorded': recorded, 'actual': actual, 'ok': ok})
+  except Exception as e:
+    return jsonify({'error': str(e)}), 500
 
 
 @app.route('/extract', methods=['POST'])
@@ -671,4 +755,6 @@ def status_page():
 
 if __name__ == '__main__':
   # use SocketIO run to enable WebSocket support
-  socketio.run(app, port=5000, host='127.0.0.1')
+  # allow_unsafe_werkzeug=True is required for the built-in dev server with
+  # recent Flask versions when using SocketIO without an async worker in dev.
+  socketio.run(app, port=5000, host='127.0.0.1', allow_unsafe_werkzeug=True)

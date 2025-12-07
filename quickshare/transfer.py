@@ -13,7 +13,7 @@ import threading
 import json
 import os
 import time
-from typing import Optional
+from typing import Optional, Callable
 from .fileutils import preallocate_file, write_chunk, get_chunk_sha256, sha256_file
 
 
@@ -28,7 +28,7 @@ def _read_n(conn, n):
 
 
 class Receiver:
-    def __init__(self, save_path: str, chunk_size: int, total_chunks: int, out_dir: Optional[str] = None):
+    def __init__(self, save_path: str, chunk_size: int, total_chunks: int, out_dir: Optional[str] = None, on_start: Optional[Callable] = None, on_complete: Optional[Callable] = None):
         # save_path is the suggested/desired path for the received file (may be inside an offer).
         # out_dir, if provided, is the enforced directory where received files (and .part temp files)
         # must be written. This prevents accidental writes to repo root or other paths.
@@ -39,6 +39,10 @@ class Receiver:
         self._data_listeners = []  # (socket, thread, port)
         self._received = {}
         self._lock = threading.Lock()
+        self._finalized = False
+        # optional lifecycle callbacks
+        self.on_start = on_start
+        self.on_complete = on_complete
 
     def _start_data_listeners(self):
         listeners = []
@@ -82,6 +86,22 @@ class Receiver:
             ch = get_chunk_sha256(data[:length])
             with self._lock:
                 self._received[chunk_idx] = ch
+            # if we've received all chunks, finalize once
+            try:
+                with self._lock:
+                    done = len(self._received) >= self.total_chunks
+                if done and not self._finalized:
+                    # mark finalized to prevent races
+                    self._finalized = True
+                    res = self.finalize()
+                    # invoke on_complete callback with final metadata
+                    try:
+                        if self.on_complete:
+                            self.on_complete({'save_path': self.save_path, 'sha256': res.get('sha256'), 'ok': res.get('ok')})
+                    except Exception:
+                        pass
+            except Exception:
+                pass
 
     def handle_offer_and_receive(self, offer: dict):
         """Given an offer dict, prepare save file, open data listeners and return reply.
@@ -133,6 +153,13 @@ class Receiver:
         for sock, port in self._data_listeners:
             t = threading.Thread(target=self._accept_and_receive, args=(sock,), daemon=True)
             t.start()
+
+        # notify start (include metadata)
+        try:
+            if self.on_start:
+                self.on_start({'filename': base, 'size': size, 'chunk_size': chunk_size, 'total_chunks': total_chunks, 'save_path': tmp})
+        except Exception:
+            pass
 
         reply = {'type': 'accept', 'ports': ports, 'save_path': tmp}
         return reply

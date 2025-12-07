@@ -5,3 +5,4 @@ pytest
 # Real-time UI
 flask-socketio
 python-socketio
+eventlet

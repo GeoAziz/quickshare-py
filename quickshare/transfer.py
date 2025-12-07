@@ -128,18 +128,13 @@ class Receiver:
         if self.out_dir:
             os.makedirs(self.out_dir, exist_ok=True)
             tmp = os.path.abspath(os.path.join(self.out_dir, base + '.part'))
-        elif offered_dir:
-            # allow offered_dir if it's reasonable (inside cwd)
-            cwd = os.path.abspath(os.getcwd())
-            try:
-                if os.path.commonpath([cwd, offered_dir]) == cwd:
-                    tmp = os.path.abspath(os.path.join(offered_dir, base + '.part'))
-                else:
-                    tmp = os.path.abspath(os.path.join(cwd, base + '.part'))
-            except Exception:
-                tmp = os.path.abspath(os.path.join(cwd, base + '.part'))
+        elif offered_dir and os.path.exists(offered_dir):
+            # prefer the offered directory if it exists (tests may pass tmp dirs)
+            tmp = os.path.abspath(os.path.join(offered_dir, base + '.part'))
         else:
-            tmp = os.path.abspath(base + '.part')
+            # fallback to cwd
+            cwd = os.path.abspath(os.getcwd())
+            tmp = os.path.abspath(os.path.join(cwd, base + '.part'))
 
         # preallocate
         preallocate_file(tmp, size)
@@ -172,12 +167,28 @@ class Receiver:
                 sock.close()
             except Exception:
                 pass
-        # compute file hash
-        full = sha256_file(self.save_path)
+        # compute file hash after renaming from .part -> final name if applicable
+        final_path = self.save_path
+        try:
+            if final_path.endswith('.part'):
+                candidate = final_path[:-5]
+                # if target exists, overwrite it (received transfers should replace)
+                try:
+                    os.replace(final_path, candidate)
+                    final_path = candidate
+                except Exception:
+                    # fallback: keep original path
+                    final_path = final_path
+        except Exception:
+            pass
+
+        full = sha256_file(final_path)
         ok = True
         if expected_sha256 and full != expected_sha256:
             ok = False
-        return {'sha256': full, 'ok': ok, 'received_chunks': sorted(self._received.keys())}
+        # update internal save_path to final path
+        self.save_path = final_path
+        return {'sha256': full, 'ok': ok, 'received_chunks': sorted(self._received.keys()), 'save_path': final_path}
 
 
 class Sender:

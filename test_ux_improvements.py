@@ -22,7 +22,7 @@ def test_file_picker_imports():
 
 def test_history_template_exists():
     """Verify HISTORY_TEMPLATE is defined"""
-    from ui import HISTORY_TEMPLATE
+    from ui import HISTORY_TEMPLATE, TEMPLATE
     assert HISTORY_TEMPLATE, "HISTORY_TEMPLATE not found"
     assert 'transfer-card' in HISTORY_TEMPLATE, "Card layout missing"
     assert 'renderTransfers' in HISTORY_TEMPLATE, "Transfer rendering function missing"

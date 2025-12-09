@@ -14,6 +14,8 @@ except Exception:
     import os
     path = os.path.join(os.path.dirname(__file__), 'scripts', 'ui.py')
     spec = importlib.util.spec_from_file_location('scripts.ui', path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not create module spec for scripts.ui from {path}")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)  # type: ignore
     globals().update({k: getattr(module, k) for k in dir(module) if not k.startswith('_')})

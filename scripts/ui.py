@@ -11,6 +11,7 @@ This is intentionally small — it runs locally and is for demo/test use.
 """
 from flask import Flask, request, render_template_string, redirect, url_for, jsonify, send_file
 from flask_socketio import SocketIO
+from werkzeug.utils import secure_filename
 import os
 import threading
 import time
@@ -29,6 +30,78 @@ import base64
 import io
 
 app = Flask(__name__)
+
+# Limit uploads to a sane default (200 MB) to avoid accidental OOMs; can be overridden via env
+app.config['MAX_CONTENT_LENGTH'] = int(os.environ.get('QUICKSHARE_MAX_UPLOAD_BYTES', 200 * 1024 * 1024))
+
+# Upload folder and cleanup policy
+UPLOAD_DIR = os.path.abspath('uploads')
+UPLOAD_TTL_SECONDS = int(os.environ.get('QUICKSHARE_UPLOAD_TTL', 24 * 3600))
+UPLOAD_CLEANUP_INTERVAL = int(os.environ.get('QUICKSHARE_UPLOAD_CLEANUP_INTERVAL', 60 * 60))
+
+_upload_cleanup_stop = threading.Event()
+
+def _upload_cleanup_worker():
+  """Periodically delete files older than UPLOAD_TTL_SECONDS from UPLOAD_DIR."""
+  try:
+    # status trackers
+    global UPLOAD_CLEANUP_LAST_RUN, UPLOAD_LAST_CLEANED_COUNT, UPLOAD_TOTAL_BYTES
+    UPLOAD_CLEANUP_LAST_RUN = None
+    UPLOAD_LAST_CLEANED_COUNT = 0
+    UPLOAD_TOTAL_BYTES = 0
+    while not _upload_cleanup_stop.is_set():
+      cleaned = 0
+      try:
+        if os.path.isdir(UPLOAD_DIR):
+          now = time.time()
+          # compute initial total bytes
+          total_bytes = 0
+          for fn in os.listdir(UPLOAD_DIR):
+            pth = os.path.join(UPLOAD_DIR, fn)
+            try:
+              if os.path.isfile(pth):
+                total_bytes += os.path.getsize(pth)
+            except Exception:
+              pass
+          # remove old files
+          for fn in os.listdir(UPLOAD_DIR):
+            path = os.path.join(UPLOAD_DIR, fn)
+            try:
+              if not os.path.isfile(path):
+                continue
+              mtime = os.path.getmtime(path)
+              if now - mtime > UPLOAD_TTL_SECONDS:
+                try:
+                  os.remove(path)
+                  cleaned += 1
+                except Exception:
+                  pass
+            except Exception:
+              pass
+          # recompute total after cleanup
+          total_after = 0
+          for fn in os.listdir(UPLOAD_DIR):
+            pth = os.path.join(UPLOAD_DIR, fn)
+            try:
+              if os.path.isfile(pth):
+                total_after += os.path.getsize(pth)
+            except Exception:
+              pass
+          UPLOAD_TOTAL_BYTES = total_after
+      except Exception:
+        pass
+      UPLOAD_LAST_CLEANED_COUNT = cleaned
+      UPLOAD_CLEANUP_LAST_RUN = time.time()
+      _upload_cleanup_stop.wait(UPLOAD_CLEANUP_INTERVAL)
+  except Exception:
+    pass
+
+# start cleanup thread
+try:
+  _upload_cleanup_thread = threading.Thread(target=_upload_cleanup_worker, daemon=True)
+  _upload_cleanup_thread.start()
+except Exception:
+  _upload_cleanup_thread = None
 
 # SocketIO for real-time push updates
 socketio = SocketIO(app, cors_allowed_origins='*')
@@ -227,6 +300,16 @@ def _shutdown_workers():
       pass
     try:
       _t_worker.join(timeout=2.0)
+    except Exception:
+      pass
+    # stop upload cleanup thread
+    try:
+      _upload_cleanup_stop.set()
+    except Exception:
+      pass
+    try:
+      if '_upload_cleanup_thread' in globals() and _upload_cleanup_thread is not None:
+        _upload_cleanup_thread.join(timeout=2.0)
     except Exception:
       pass
   except Exception:
@@ -539,10 +622,19 @@ body {
             <input type="file" name="file" id="send-input" accept=".tar.gz,.tar,.zip,.gz">
             <label for="send-input" class="file-input-label">
               <span id="send-label-text">📄 Click to select or drag file</span>
+              <small id="send-max-size" style="color:#bbb; margin-left:8px; font-size:0.9em;">(max: {{ max_upload_human }})</small>
             </label>
             <span id="send-name" class="file-name"></span>
           </div>
           <input type="hidden" name="file" id="send-file-hidden" value="">
+          <!-- Upload progress (for browser -> server upload) -->
+          <div id="upload-progress-container" class="progress-container" style="display:none; margin-top:10px;">
+            <div style="font-weight:600; margin-bottom:8px;">Uploading to server...</div>
+            <div class="progress-bar">
+              <div class="progress-fill" id="upload-progress-fill" style="width:0%"></div>
+            </div>
+            <div class="progress-text"><span id="upload-progress-pct">0</span>%</div>
+          </div>
         </div>
         <button class="btn" type="submit" id="send-btn" disabled>Send File</button>
         <div id="progress-container" class="progress-container">
@@ -583,6 +675,9 @@ body {
 </style>
 <div id="qs-toast-root" class="qs-toast-container" aria-live="polite" aria-atomic="true"></div>
 <script>
+// Max upload size in bytes (server-provided)
+const MAX_UPLOAD_BYTES = {{ max_upload_bytes|default(0) }};
+
 function qsGet(name){
   const url = new URL(window.location.href);
   return url.searchParams.get(name);
@@ -623,10 +718,20 @@ function setupFilePicker(inputId, labelId, nameId, hiddenId, btnId) {
       const files = Array.from(e.target.files);
       const fileName = files.map(f => f.name).join(', ');
       if(nameEl) nameEl.textContent = fileName.length > 50 ? fileName.substring(0, 47) + '...' : fileName;
-      if(btn) btn.disabled = false;
-      // Store file path in hidden field (path is relative to working directory)
-      if(hidden && files.length > 0) {
-        hidden.value = files[0].name;
+      // For the send-input we need to upload the file to the server first because
+      // browsers do not reveal the client's filesystem path to the server.
+      if(inputId === 'send-input'){
+        if(btn) btn.disabled = true;
+        if(hidden && files.length > 0){
+          // upload the selected file and set hidden input to the server path
+          uploadFile(files[0], hidden, btn, nameEl);
+        }
+      } else {
+        // Non-send inputs (e.g., package folder selection) — we only show the name
+        if(btn) btn.disabled = false;
+        if(hidden && files.length > 0) {
+          hidden.value = files[0].name;
+        }
       }
     }
   });
@@ -650,6 +755,55 @@ function setupFilePicker(inputId, labelId, nameId, hiddenId, btnId) {
   });
   
   label.addEventListener('click', () => input.click());
+}
+
+// Upload helper: uploads file via /upload and writes returned server path into hidden input
+// Upload helper: uploads file via /upload (XHR) and writes returned server path into hidden input
+function uploadFile(file, hiddenEl, btn, nameEl){
+  try{
+    const upContainer = document.getElementById('upload-progress-container');
+    const upFill = document.getElementById('upload-progress-fill');
+    const upPct = document.getElementById('upload-progress-pct');
+    if(upContainer) upContainer.style.display = 'block';
+    if(upFill) upFill.style.width = '0%';
+    if(upPct) upPct.textContent = '0';
+    const xhr = new XMLHttpRequest();
+    const fd = new FormData();
+    fd.append('file', file, file.name);
+    xhr.open('POST', '/upload', true);
+    xhr.upload.onprogress = function(e){
+      try{
+        if(e.lengthComputable){
+          const pct = Math.round((e.loaded / e.total) * 100);
+          if(upFill) upFill.style.width = pct + '%';
+          if(upPct) upPct.textContent = pct.toString();
+        }
+      }catch(err){ console.debug('upload progress err', err); }
+    };
+    xhr.onload = function(){
+      try{
+        if(upContainer) setTimeout(()=>{ upContainer.style.display = 'none'; }, 800);
+        if(xhr.status >= 200 && xhr.status < 300){
+          let js = {};
+          try{ js = JSON.parse(xhr.responseText || '{}'); }catch(e){ js = {}; }
+          if(js && js.path){
+            if(hiddenEl) hiddenEl.value = js.path;
+            if(btn) btn.disabled = false;
+            _makeToast('File uploaded to server', 'success', 2500);
+            return;
+          }
+        }
+        _makeToast('Upload failed', 'warn', 4000);
+        if(btn) btn.disabled = false;
+      }catch(e){ console.debug('upload onload err', e); _makeToast('Upload failed', 'warn', 4000); if(btn) btn.disabled = false; }
+    };
+    xhr.onerror = function(){
+      try{ if(upContainer) upContainer.style.display = 'none'; }catch(e){}
+      _makeToast('Upload failed', 'warn', 4000);
+      if(btn) btn.disabled = false;
+    };
+    xhr.send(fd);
+  }catch(e){ console.debug('uploadFile error', e); if(btn) btn.disabled = false; }
 }
 
 // Initialize file pickers on page load
@@ -1492,7 +1646,15 @@ def index():
         status.append(f"Receiver port: {recv_port}")
     # pass through optional tid so UI can poll
     tid = request.args.get('tid') if request else None
-    return render_template_string(TEMPLATE, peers=peers, recv_running=recv_running, recv_port=recv_port, recv_addr=recv_addr, status='\n'.join(status), tid=tid)
+    max_upload = app.config.get('MAX_CONTENT_LENGTH', 0)
+    # human friendly display (MB if >=1MB else KB)
+    if max_upload >= 1024*1024:
+      max_upload_human = f"{max_upload/1024/1024:.1f} MB"
+    elif max_upload >= 1024:
+      max_upload_human = f"{max_upload/1024:.1f} KB"
+    else:
+      max_upload_human = f"{max_upload} B"
+    return render_template_string(TEMPLATE, peers=peers, recv_running=recv_running, recv_port=recv_port, recv_addr=recv_addr, status='\n'.join(status), tid=tid, max_upload_bytes=max_upload, max_upload_human=max_upload_human)
 
 
 @app.route('/start-recv', methods=['POST'])
@@ -1608,6 +1770,57 @@ def start_recv():
     RECV_STATE['server'] = srv
     RECV_STATE['announcer'] = ann
     return redirect(url_for('index'))
+
+
+@app.route('/upload', methods=['POST'])
+def upload_file():
+  """Accept a single file upload and persist it to server 'uploads/' directory.
+  Returns JSON with the server-side path which can then be used by /send.
+  """
+  f = request.files.get('file')
+  if not f:
+    return jsonify({'error': 'no file provided'}), 400
+  upload_dir = os.path.abspath('uploads')
+  os.makedirs(upload_dir, exist_ok=True)
+  # sanitize filename
+  filename = secure_filename(getattr(f, 'filename', 'upload'))
+  if not filename:
+    filename = 'upload'
+  save_path = os.path.join(upload_dir, filename)
+  base, ext = os.path.splitext(filename)
+  i = 1
+  while os.path.exists(save_path):
+    save_path = os.path.join(upload_dir, f"{base}-{i}{ext}")
+    i += 1
+  try:
+    f.save(save_path)
+  except Exception as e:
+    return jsonify({'error': str(e)}), 500
+  return jsonify({'path': save_path})
+
+
+@app.route('/upload/cleanup-status', methods=['GET'])
+def upload_cleanup_status():
+  """Return simple JSON about upload cleanup runs and current storage usage."""
+  try:
+    total_files = 0
+    total_bytes = 0
+    if os.path.isdir(UPLOAD_DIR):
+      for fn in os.listdir(UPLOAD_DIR):
+        pth = os.path.join(UPLOAD_DIR, fn)
+        if os.path.isfile(pth):
+          total_files += 1
+          try:
+            total_bytes += os.path.getsize(pth)
+          except Exception:
+            pass
+  except Exception:
+    total_files = 0
+    total_bytes = 0
+  last_run = globals().get('UPLOAD_CLEANUP_LAST_RUN')
+  last_cleaned = globals().get('UPLOAD_LAST_CLEANED_COUNT', 0)
+  total_bytes_tracked = globals().get('UPLOAD_TOTAL_BYTES', total_bytes)
+  return jsonify({'last_run': last_run, 'last_cleaned_count': last_cleaned, 'total_files': total_files, 'total_bytes': total_bytes_tracked, 'ttl_seconds': UPLOAD_TTL_SECONDS})
 
 
 @app.route('/stop-recv', methods=['POST'])
